@@ -1,4 +1,5 @@
 // ECG BLE with Multithreading, Dynamic Batch Storage & Two-Phase (Acquisition/Transmission) Mode
+// USE start and stop 
 /*
 ON SERIAL MONITOR                                             
 Device Connected with handle: 0
