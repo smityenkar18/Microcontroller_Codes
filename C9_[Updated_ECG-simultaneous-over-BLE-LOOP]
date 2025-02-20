@@ -1,0 +1,188 @@
+/* Simulataneous BLE transfer, Some values get displayed before the message 'This is batch 1' due to ble sending the data.
+
+
+*/
+
+#include <bluefruit.h>
+#include <Arduino.h>
+#include <vector>
+using std::vector;
+
+// ----- Configuration Parameters -----
+#define ECG_PIN 1                // ADC pin for the ECG sensor (AD8232)
+#define BUFFER_SIZE 200          // 200 samples per batch (1 sec at 200Hz)
+#define SAMPLE_INTERVAL_MS 5     // Sample every 5 ms for 200Hz
+
+// ----- Global Variables -----
+volatile bool deviceConnected = false;
+volatile bool acquisitionActive = false;
+volatile bool transmissionPhase = false;
+uint32_t batchCount = 0;
+
+BLEUart bleUart;
+
+// ----- Batch Structure -----
+typedef struct {
+  uint16_t samples[BUFFER_SIZE];
+  uint16_t count;
+} Batch;
+
+vector<Batch> batchStorage;
+QueueHandle_t acquisitionQueue;
+QueueHandle_t transmissionQueue;
+
+// ----- Function: Send Data Over BLE -----
+void sendDataBLE(uint16_t value) {
+  char hexStr[5];
+  sprintf(hexStr, "%04X", value);
+  bleUart.print(hexStr);
+  bleUart.print(",");
+}
+
+// ----- Task 1: ECG Data Acquisition -----
+void taskAcquisition(void *pvParameters) {
+  while (1) {
+    if (deviceConnected && acquisitionActive) {
+      uint16_t sample = analogRead(ECG_PIN);
+      if (xQueueSend(acquisitionQueue, &sample, 0) != pdTRUE) {
+        Serial.println("Acquisition queue full! Data loss may occur.");
+      }
+      vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+// ----- Task 2: ECG Data Processing -----
+void taskProcessing(void *pvParameters) {
+  uint16_t localBuffer[BUFFER_SIZE];
+  uint16_t localIndex = 0;
+  
+  while (1) {
+    uint16_t sample;
+    if (xQueueReceive(acquisitionQueue, &sample, portMAX_DELAY) == pdTRUE) {
+      localBuffer[localIndex++] = sample;
+      xQueueSend(transmissionQueue, &sample, 0); // Send to separate transmission queue
+      
+      if (localIndex >= BUFFER_SIZE) {
+        Batch batch;
+        memcpy(batch.samples, localBuffer, BUFFER_SIZE * sizeof(uint16_t));
+        batch.count = BUFFER_SIZE;
+        batchStorage.push_back(batch);
+        Serial.print("Batch acquired: ");
+        Serial.println(++batchCount);
+        localIndex = 0;
+      }
+    }
+  }
+}
+
+// ----- Task 3: Command Handling & Data Transmission -----
+void taskTransmission(void *pvParameters) {
+  while (1) {
+    if (Serial.available()) {
+      String command = Serial.readStringUntil('\n');
+      command.trim();
+
+      if (command.equalsIgnoreCase("START")) {
+        Serial.println("START command received! Acquisition Resumed.");
+        batchStorage.clear();
+        batchCount = 0;
+        acquisitionActive = true;
+        transmissionPhase = false;
+      } else if (command.equalsIgnoreCase("STOP")) {
+        Serial.println("STOP command received! Acquisition Paused. Starting transmission of stored data.");
+        acquisitionActive = false;
+        transmissionPhase = true;
+      }
+    }
+
+    if (transmissionPhase) {
+      for (size_t i = 0; i < batchStorage.size(); i++) {
+        Serial.print("Transmitting Batch ");
+        Serial.println(i + 1);
+        
+        String header = "This is Batch " + String(i + 1);
+        bleUart.println(header);
+        
+        for (int j = 0; j < batchStorage[i].count; j++) {
+          sendDataBLE(batchStorage[i].samples[j]);
+          vTaskDelay(pdMS_TO_TICKS(2)); // Prevent BLE overload
+        }
+        bleUart.println();
+        
+        batchStorage.erase(batchStorage.begin() + i); // Clear batch after sending
+        Serial.print("Batch ");
+        Serial.print(i + 1);
+        Serial.println(" transmission complete and buffer cleared.");
+        vTaskDelay(pdMS_TO_TICKS(500));
+      }
+      Serial.println("All batches transmitted.");
+      transmissionPhase = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ----- Task 4: Real-Time ECG Data Transmission -----
+void taskLiveTransmission(void *pvParameters) {
+  while (1) {
+    uint16_t sample;
+    if (deviceConnected && acquisitionActive) {
+      if (xQueueReceive(transmissionQueue, &sample, portMAX_DELAY) == pdTRUE) {
+        sendDataBLE(sample);
+        vTaskDelay(pdMS_TO_TICKS(2)); // Ensure smooth BLE transmission
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+// ----- BLE MTU Optimization -----
+void connect_callback(uint16_t conn_handle) {
+  BLEConnection* connection = Bluefruit.Connection(conn_handle);
+  connection->requestMtuExchange(244);
+  delay(100);
+  uint16_t mtu = connection->getMtu();
+  Serial.print("Negotiated MTU Size: ");
+  Serial.println(mtu);
+  deviceConnected = true;
+}
+
+// ----- BLE Event Handlers -----
+void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  Serial.println("Device Disconnected.");
+  deviceConnected = false;
+}
+
+// ----- Setup Function -----
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  pinMode(ECG_PIN, INPUT);
+
+  Serial.println("Initializing Bluefruit...");
+  Bluefruit.begin();
+  Bluefruit.setName("XIAO_ECG_Monitor");
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+  bleUart.begin();
+  Bluefruit.Advertising.addService(bleUart);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start();
+
+  acquisitionQueue = xQueueCreate(256, sizeof(uint16_t));
+  transmissionQueue = xQueueCreate(256, sizeof(uint16_t));
+
+  xTaskCreate(taskAcquisition,  "AcquisitionTask", 2048, NULL, 2, NULL);
+  xTaskCreate(taskProcessing,   "ProcessingTask",  2048, NULL, 1, NULL);
+  xTaskCreate(taskTransmission, "TransmissionTask",2048, NULL, 1, NULL);
+  xTaskCreate(taskLiveTransmission, "LiveTransmissionTask", 2048, NULL, 3, NULL);
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
