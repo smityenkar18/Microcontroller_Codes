@@ -1,0 +1,203 @@
+#include <bluefruit.h>
+#include "CircularBuffer.hpp"   // Use the recommended .hpp include
+#include <Arduino.h>
+
+// If IRAM_ATTR is not defined for your board, define it as empty.
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
+
+// ----- Configuration Parameters -----
+#define ECG_SIGNAL_PIN     A1         // Analog pin for the ECG sensor
+#define ECG_INTERRUPT_PIN  2          // Digital pin for ECG data ready interrupt (not used in this version)
+#define SAMPLE_INTERVAL_MS 5          // Sampling every 5 ms (200Hz)
+#define ECG_BATCH_SIZE     5          // Number of samples per BLE packet (total packet size: 1+1+(5*2)+1+1 = 14 bytes)
+#define CIRC_BUFFER_SIZE   100        // Size of the circular buffer
+
+// BLE Packet Definitions (binary values)
+#define HEADER  0x0A
+#define FOOTER1 0x03
+#define FOOTER2 0x17
+
+// ----- Global Variables -----
+BLEUart bleSerial;           // BLE UART service
+volatile bool deviceConnected = false;
+volatile bool acquisitionActive = false; // Controls whether data is being acquired
+
+uint8_t packetCounter = 0;   // Packet counter (for ensuring uniqueness)
+volatile uint32_t batchCount = 0;   // Number of batches sent (for debugging)
+
+// Create a circular buffer for ECG samples
+CircularBuffer<int, CIRC_BUFFER_SIZE> ecgBuffer;
+
+// FreeRTOS software timer handle
+TimerHandle_t ecgTimer = NULL;
+
+// ----- BLE Callbacks -----
+void connect_callback(uint16_t conn_handle) {
+  BLEConnection* connection = Bluefruit.Connection(conn_handle);
+  connection->requestMtuExchange(244); // Request larger MTU if needed.
+  deviceConnected = true;
+  Serial.println("Device Connected.");
+}
+
+void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  deviceConnected = false;
+  Serial.println("Device Disconnected.");
+}
+
+// ----- BLE UART Rx Callback -----
+// This callback is invoked whenever data is received over BLE UART.
+// Here, we process only the "Start" command from the app.
+void onRxData(uint16_t conn_handle) {
+  String command = bleSerial.readString();
+  command.trim();
+  if (command.equalsIgnoreCase("Start")) {
+    acquisitionActive = true;
+    Serial.println("ECG Data Acquisition Started via BLE.");
+    bleSerial.print("Started"); // Send confirmation to the app.
+  }
+  // We do not process "Stop" here.
+}
+
+// ----- Updated BLE Setup -----
+void setupBLE() {
+  Bluefruit.begin();
+
+  // Stop advertising before making changes
+  Bluefruit.Advertising.stop();
+
+  // Set BLE device name before enabling advertising
+  Bluefruit.setName("cPATCH");
+
+  // Set transmission power (adjust if needed)
+  Bluefruit.setTxPower(-4);
+
+  // Initialize BLE UART service and set up the Rx callback
+  bleSerial.begin();
+  bleSerial.setRxCallback(onRxData);
+
+  // Clear previous advertisement data and set up new advertisement
+  Bluefruit.Advertising.clearData();
+  Bluefruit.Advertising.addService(bleSerial);
+  Bluefruit.Advertising.addName();  // Ensures the name is visible to other devices
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start();
+}
+
+// ----- BLE Transmission Function -----
+// Sends the binary packet via BLE.
+void sendECGData(uint8_t *packet, int length) {
+  if (bleSerial.notifyEnabled()) {
+    bleSerial.write(packet, length);
+  }
+}
+
+// ----- MakePacket Function -----
+// Formats a batch of ECG samples into a binary BLE packet and transmits it.
+// Packet format: [HEADER][PacketCounter][Sample1 (2 bytes)]...[SampleN (2 bytes)][FOOTER1][FOOTER2]
+void makePacket(int ecgData[], int batchSize) {
+  int packetSize = 2 + (2 * batchSize) + 2;
+  if (packetSize > 20) {
+    Serial.println("Error: Packet size exceeds allowed payload size.");
+    return;
+  }
+
+  uint8_t ecgPacket[20];
+  int index = 0;
+
+  ecgPacket[index++] = HEADER;
+  ecgPacket[index++] = packetCounter++;
+
+  for (int i = 0; i < batchSize; i++) {
+    ecgPacket[index++] = (ecgData[i] >> 8) & 0xFF;  // High byte
+    ecgPacket[index++] = ecgData[i] & 0xFF;         // Low byte
+  }
+
+  ecgPacket[index++] = FOOTER1;
+  ecgPacket[index++] = FOOTER2;
+
+  sendECGData(ecgPacket, index);
+
+  batchCount++;
+  Serial.print("Batch sent: ");
+  Serial.print(batchCount);
+  Serial.print(" | Packet Counter: ");
+  Serial.println(packetCounter);
+
+  Serial.print("Packet: ");
+  for (int i = 0; i < index; i++) {
+    if (ecgPacket[i] < 16) Serial.print("0");
+    Serial.print(ecgPacket[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// ----- ECG Data Processing -----
+// Called by the timer every SAMPLE_INTERVAL_MS ms.
+// Reads an ECG sample and pushes it into the circular buffer.
+// When enough samples are collected, they are sent as a binary packet.
+void processECGData(TimerHandle_t xTimer) {
+  if (acquisitionActive) {
+    int rawECG = analogRead(ECG_SIGNAL_PIN);
+    ecgBuffer.push(rawECG);
+
+    if (ecgBuffer.size() > (CIRC_BUFFER_SIZE - 5)) {
+      Serial.print("Warning: Circular buffer nearly full! Size: ");
+      Serial.println(ecgBuffer.size());
+    }
+
+    if (ecgBuffer.size() >= ECG_BATCH_SIZE) {
+      int batch[ECG_BATCH_SIZE];
+      for (int i = 0; i < ECG_BATCH_SIZE; i++) {
+        batch[i] = ecgBuffer.shift();
+      }
+
+      Serial.print("Batch Data: ");
+      for (int i = 0; i < ECG_BATCH_SIZE; i++) {
+        Serial.print(batch[i]);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      makePacket(batch, ECG_BATCH_SIZE);
+    }
+  }
+}
+
+// ----- Setup Function -----
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(ECG_SIGNAL_PIN, INPUT);
+  pinMode(ECG_INTERRUPT_PIN, INPUT_PULLUP);
+
+  setupBLE();
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+
+  ecgTimer = xTimerCreate("ECG_Timer", pdMS_TO_TICKS(SAMPLE_INTERVAL_MS), pdTRUE, NULL, processECGData);
+  if (ecgTimer != NULL) {
+    xTimerStart(ecgTimer, 0);
+  }
+
+  Serial.println("Use your app to send 'Start' command, and type 'Stop' on Serial Monitor to stop.");
+}
+
+// ----- Main Loop -----
+// Only processes the "Stop" command from the Serial Monitor.
+void loop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command.equalsIgnoreCase("Stop")) {
+      acquisitionActive = false;
+      while (ecgBuffer.size() > 0) {
+        ecgBuffer.shift();
+      }
+      Serial.println("ECG Data Acquisition Stopped (via Serial).");
+    }
+  }
+}
