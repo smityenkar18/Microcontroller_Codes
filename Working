@@ -1,0 +1,113 @@
+#define ECG_PIN 1               // ADC pin for the ECG sensor (AD8232)
+#define BUFFER_SIZE 124          // 200 samples per batch (1 second at 200Hz)
+#define SAMPLE_INTERVAL_MS 8     // Sample every 8ms for approx 120, 5 ms for 200Hz
+#include <Adafruit_TinyUSB.h>
+#include <bluefruit.h>
+BLEUart bleUart;
+
+bool deviceConnected = false;
+bool transmitting = false;
+uint8_t ecgBuffer[BUFFER_SIZE]; // Buffer to hold one batch of ECG samples.
+uint32_t batchCount = 0;         // Batch counter.
+int bufferIndex = 0;             // Current index in the buffer.
+unsigned long lastSampleTime = 0; // Last time a sample was taken.
+uint8_t packet[124];                     // Full 52-byte packet
+
+// ----- ECG Sampling Function -----
+void sampleECG() {
+
+  
+  int adcValue = analogRead(ECG_PIN);  // Direct ADC reading
+  ecgBuffer[bufferIndex] = adcValue & 0xFF;         // Low byte
+  ecgBuffer[bufferIndex + 1] = (adcValue >> 8) & 0xFF; // High byte 
+  bufferIndex += 2;
+
+  // When the buffer is full (200 samples), transmit the batch.
+  if (bufferIndex >= 120) {
+  //  for (int i = 0; i < BUFFER_SIZE; i++) {
+      //Serial.println(ecgBuffer[i]);  // Send each value over USB Serial
+      packet[0] = 0x0A;  // Direct ADC reading
+      packet[1] = 0x0A;  // Direct ADC reading
+        memcpy(&packet[2], ecgBuffer, 120); // 48 bytes of ECG data
+
+      packet[122] = 0x03;  // Direct ADC reading
+      packet[123] = 0x17;  // Direct ADC reading
+
+       bleUart.write(packet,124 );
+
+    //}
+
+    // batchCount++;
+    // Serial.print("Batch sent: ");
+    // Serial.println(batchCount);
+
+    bufferIndex = 0;  // Reset buffer for next batch
+  }
+}
+// ----- BLE Connection Parameter Optimization -----
+void setPreferredConnectionParams() {
+  uint16_t min_conn_interval = 6;  // 7.5ms (6 * 1.25ms)
+  uint16_t max_conn_interval = 24; // 30ms (24 * 1.25ms)
+  Bluefruit.Periph.setConnInterval(min_conn_interval, max_conn_interval);
+}
+
+// ----- BLE Event Handlers -----
+void connect_callback(uint16_t conn_handle) {
+  Serial.println("Device Connected!");
+  deviceConnected = true;
+  setPreferredConnectionParams();
+}
+
+void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  Serial.println("Device Disconnected!");
+  deviceConnected = false;
+  transmitting = false;
+}
+
+
+// ----- Setup Function -----
+void setup() {
+  Serial.begin(115200);
+  pinMode(ECG_PIN, INPUT);
+  Serial.println("USB Serial ECG Monitor Ready. Send 'START' to begin.");
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.begin();
+  Bluefruit.setName("SMIT_ECG_Monitor");
+
+  // Set BLE connection callbacks.
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+
+  bleUart.begin();
+  Bluefruit.Advertising.addService(bleUart);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start();
+
+  Serial.println("BLE UART Ready. Waiting for connection...");
+
+}
+
+// ----- Main Loop -----
+void loop() {
+  // Check for start/stop command from Serial Monitor
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command.equalsIgnoreCase("START")) {
+      transmitting = true;
+      Serial.println("ECG Transmission Started");
+    } else if (command.equalsIgnoreCase("STOP")) {
+      transmitting = false;
+      Serial.println("ECG Transmission Stopped");
+    }
+  }
+
+  if (transmitting) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+      lastSampleTime = currentMillis;
+      sampleECG();
+    }
+  }
+}
